@@ -1,0 +1,536 @@
+---
+title: "Data Cleaning and Preliminary Analysis: Airbnb Listings in Amsterdam"
+author: "Your Name"
+date: "`r format(Sys.Date(), '%d %B %Y')`"
+output:
+  word_document:
+    toc: true
+    toc_depth: 2
+    fig_width: 7
+    fig_height: 4.5
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, warning = FALSE, message = FALSE)
+```
+
+# 1. Introduction
+
+**Objective.** Clean, preprocess and explore the Inside Airbnb Amsterdam listings dataset using R, and extract initial insights into what drives nightly price.
+
+**Tools.** R, tidyverse (wrangling and ggplot2), janitor (name cleaning), naniar (missing-data visuals), skimr (summaries), corrplot (correlations).
+
+```{r libraries}
+library(tidyverse)
+library(janitor)
+library(naniar)
+library(skimr)
+library(corrplot)
+library(knitr)
+```
+
+# 2. Dataset Overview
+
+**Source.** Inside Airbnb (https://insideairbnb.com/get-the-data/), Amsterdam, the detailed file `listings.csv.gz`. *(Write the snapshot date shown on the website here.)*
+
+**Why this dataset.** It is real scraped data, with text-formatted numbers (`$1,200.00`, `95%`), genuine missing values, extreme price and minimum-night outliers, and a mix of numeric, binary and categorical variables.
+
+**Columns used.** The original file has 90 columns, most of them free text, URLs and IDs. I selected 22 that are relevant to pricing and listing quality. Five of these (bathrooms, host_response_time, host_response_rate, host_acceptance_rate, instant_bookable) turned out to be completely empty in this snapshot and are dropped during cleaning.
+
+| Variable | Type | Description |
+|---|---|---|
+| price | Numeric (text in file) | Nightly price in USD, **target** |
+| room_type, property_type | Categorical | Kind of listing |
+| neighbourhood_cleansed | Categorical | Amsterdam neighbourhood |
+| accommodates, bedrooms, beds | Numeric | Capacity and size |
+| minimum_nights, availability_365 | Numeric | Booking rules and availability |
+| number_of_reviews, reviews_per_month, review_scores_rating | Numeric | Review activity and quality |
+| host_is_superhost | Binary (t/f) | Whether the host is a Superhost |
+| host_listings_count | Numeric | Listings owned by the host |
+| latitude, longitude | Numeric | Location |
+
+# 3. Initial Inspection
+
+```{r load}
+raw <- read_csv("listings.csv.gz", na = c("", "NA", "N/A")) %>% clean_names()
+cat("Original size:", nrow(raw), "rows x", ncol(raw), "columns\n")
+
+keep_cols <- c("id", "price", "room_type", "property_type", "neighbourhood_cleansed",
+               "accommodates", "bedrooms", "beds", "bathrooms", "minimum_nights",
+               "availability_365", "number_of_reviews", "reviews_per_month",
+               "review_scores_rating", "host_response_time", "host_response_rate",
+               "host_acceptance_rate", "host_is_superhost", "instant_bookable",
+               "host_listings_count", "latitude", "longitude")
+
+df <- raw %>% select(any_of(keep_cols))
+dim(df)
+```
+
+```{r inspect}
+str(df)
+```
+
+```{r summary}
+summary(df)
+```
+
+```{r skim}
+skim(df)
+```
+
+**Interpretation.** The raw file has 10,612 listings and 90 columns, of which 22 were selected. `price` arrives as text (for example "$97.00"), and several columns are already visibly empty. `summary()` shows very large maximum values for `minimum_nights` and `number_of_reviews`, which points to strong right skew and outliers, and the `NA` counts show that price and the review columns are the main gaps.
+
+# 4. Data Quality Audit
+
+```{r audit}
+# 4.1 Missing values per column
+miss_var_summary(df) %>% filter(n_miss > 0) %>%
+  kable(digits = 1, caption = "Columns with missing values (raw)")
+
+# 4.1b Columns that are completely empty
+all_na <- names(df)[colSums(is.na(df)) == nrow(df)]
+cat("Columns that are 100% missing:", paste(all_na, collapse = ", "), "\n")
+
+# 4.2 Duplicate listings
+cat("Duplicate listing IDs:", sum(duplicated(df$id)), "\n")
+
+# 4.3 Text-formatted numbers
+head(df$price, 5)
+
+# 4.4 Category check
+table(df$room_type)
+table(df$host_is_superhost, useNA = "ifany")
+```
+
+**Findings.** There are no duplicate listing IDs. Five columns are 100% missing (`bathrooms`, `host_response_time`, `host_response_rate`, `host_acceptance_rate`, `instant_bookable`). Price is missing for 4,573 listings (43.1%), the review columns for 1,002 (9.4%), and `beds`, `minimum_nights` and `bedrooms` have small gaps (3.6%, 2.5% and 0.3%). Price is stored as text. Room types are heavily dominated by entire homes (8,579), followed by private rooms (1,987), with only 24 hotel rooms and 22 shared rooms.
+
+# 5. Data Cleaning
+
+## 5.1 Fix data types
+
+**Why.** `price` is stored as text like `"$97.00"`, so no calculation is possible until it is converted. The superhost flag is recoded to 1/0.
+
+**Dropping empty columns.** The audit found columns that are 100% missing in this snapshot (`bathrooms`, `host_response_time`, `host_response_rate`, `host_acceptance_rate`, `instant_bookable`). There is nothing to impute from, so they are removed. This is the extreme case of the rule "drop columns with more than about 50% missing".
+
+```{r types}
+to_bin <- function(x) {
+  case_when(as.character(x) %in% c("t", "TRUE")  ~ 1L,
+            as.character(x) %in% c("f", "FALSE") ~ 0L,
+            TRUE ~ NA_integer_)
+}
+
+df <- df %>%
+  select(-all_of(all_na)) %>%
+  mutate(
+    price = parse_number(as.character(price)),
+    host_is_superhost = to_bin(host_is_superhost),
+    across(c(room_type, property_type, neighbourhood_cleansed), as.factor)
+  )
+
+glimpse(df)
+```
+
+## 5.2 Remove duplicates and invalid values
+
+```{r invalid}
+n0 <- nrow(df)
+df <- df %>% distinct(id, .keep_all = TRUE)
+cat("Duplicates removed:", n0 - nrow(df), "\n")
+
+# A price of 0 or less is not a real nightly rate
+cat("Listings with price <= 0:", sum(df$price <= 0, na.rm = TRUE), "\n")
+df <- df %>% mutate(price = ifelse(price <= 0, NA, price))
+```
+
+## 5.3 Missing values
+
+### 5.3.1 Detect and visualize
+
+```{r miss_table}
+miss_var_summary(df) %>% filter(n_miss > 0) %>%
+  kable(digits = 1, caption = "Missing values after type fixing")
+```
+
+```{r miss_plot, fig.cap="Percentage of missing values per column"}
+gg_miss_var(df, show_pct = TRUE) + labs(title = "Missingness by variable")
+```
+
+```{r miss_pattern, fig.cap="Missingness map (random sample of 1,000 listings)"}
+set.seed(123)
+vis_miss(df %>% slice_sample(n = min(1000, nrow(df))) %>% select(-id, -latitude, -longitude))
+```
+
+### 5.3.2 Is the missingness random?
+
+The rating columns look suspicious, so I tested whether they are missing for listings with no reviews.
+
+```{r structural}
+table(rating_missing = is.na(df$review_scores_rating),
+      no_reviews = df$number_of_reviews == 0)
+```
+
+**Interpretation.** All 1,002 listings with a missing review score also have zero reviews, and no listing with at least one review is missing a score. The missingness is therefore structural rather than random: the value does not exist, rather than having been lost. Imputing it blindly would fabricate guest opinions, so I keep a binary flag, `rating_missing`, which preserves this information, and fill the rating with the median only so that numeric analysis can run.
+
+### 5.3.3 Strategy per column
+
+| Column | Strategy | Reason |
+|---|---|---|
+| price (target) | **Drop rows** with missing price | Imputing the outcome I want to analyse would invent data |
+| bedrooms, beds | Median **by `accommodates`** | A 4-guest listing is likely to have similar beds to other 4-guest listings |
+| review_scores_rating | Median plus `rating_missing` flag | Structural gap, so the flag keeps the signal |
+| reviews_per_month | Set to 0 when there are no reviews | Logically zero, not unknown |
+| minimum_nights | Overall median | Small share missing and heavily skewed, so median is robust |
+| host_is_superhost | Mode | Binary with few gaps |
+| 5 empty columns | **Dropped** (section 5.1) | 100% missing, so nothing to impute from |
+
+### 5.3.4 Experiment: which imputation is best?
+
+To justify the choice for `beds`, I hid 5% of known values at random (**a simulation on the real data, not real data loss**), imputed them three ways, and compared with the truth.
+
+```{r experiment}
+set.seed(123)
+known <- df %>% filter(!is.na(beds), !is.na(accommodates))
+idx   <- sample(nrow(known), size = round(0.05 * nrow(known)))
+truth <- known$beds[idx]
+
+tmp <- known
+tmp$beds[idx] <- NA
+
+imp_mean   <- rep(mean(tmp$beds, na.rm = TRUE), length(idx))
+imp_median <- rep(median(tmp$beds, na.rm = TRUE), length(idx))
+
+grp <- tmp %>% group_by(accommodates) %>% summarise(gm = median(beds, na.rm = TRUE))
+imp_group <- tmp[idx, ] %>% left_join(grp, by = "accommodates") %>% pull(gm)
+imp_group[is.na(imp_group)] <- median(tmp$beds, na.rm = TRUE)
+
+mae  <- function(a, b) mean(abs(a - b))
+rmse <- function(a, b) sqrt(mean((a - b)^2))
+
+tibble(method = c("Overall mean", "Overall median", "Median by accommodates"),
+       MAE  = c(mae(truth, imp_mean),  mae(truth, imp_median),  mae(truth, imp_group)),
+       RMSE = c(rmse(truth, imp_mean), rmse(truth, imp_median), rmse(truth, imp_group))) %>%
+  kable(digits = 3, caption = "Imputation error for beds (lower is better)")
+```
+
+**Interpretation.** Imputing `beds` with the median within each `accommodates` group roughly halved the average error compared with the overall mean (MAE 0.405 versus 0.880) and gave the lowest RMSE (0.814). The overall median had a lower MAE than the mean but a higher RMSE, so it recovers typical listings well but misses badly on large ones, because the distribution is right-skewed. Grouping by capacity works because the number of beds depends strongly on how many guests a listing sleeps. KNN (`VIM::kNN`) and multiple imputation (`mice`) were considered but are not needed, since only 3.6% of `beds` and 0.3% of `bedrooms` were missing.
+
+### 5.3.5 Apply the strategy
+
+```{r impute}
+n_before <- nrow(df)
+df <- df %>% filter(!is.na(price))
+cat("Rows dropped for missing price:", n_before - nrow(df), "| Remaining:", nrow(df), "\n")
+
+get_mode <- function(x) { x <- x[!is.na(x)]; as.numeric(names(sort(table(x), decreasing = TRUE))[1]) }
+
+df <- df %>%
+  mutate(
+    rating_missing    = as.integer(is.na(review_scores_rating)),
+    reviews_per_month = ifelse(number_of_reviews == 0 & is.na(reviews_per_month), 0, reviews_per_month)
+  ) %>%
+  group_by(accommodates) %>%
+  mutate(across(c(bedrooms, beds), ~ replace_na(., median(., na.rm = TRUE)))) %>%
+  ungroup() %>%
+  mutate(
+    across(c(bedrooms, beds, minimum_nights, review_scores_rating, reviews_per_month,
+             host_listings_count),
+           ~ replace_na(., median(., na.rm = TRUE))),
+    host_is_superhost = replace_na(host_is_superhost, get_mode(host_is_superhost))
+  )
+
+cat("Remaining NA values:", sum(is.na(df)), "\n")
+```
+
+## 5.4 Outlier detection
+
+Two methods: the **IQR rule** (1.5 x IQR beyond the quartiles) and **Z-scores** (|z| > 3).
+
+```{r outliers}
+num_vars <- c("price", "accommodates", "bedrooms", "beds", "minimum_nights",
+              "availability_365", "number_of_reviews", "review_scores_rating")
+
+iqr_flag <- function(x) {
+  q <- quantile(x, c(.25, .75)); i <- q[2] - q[1]
+  x < q[1] - 1.5 * i | x > q[2] + 1.5 * i
+}
+
+tibble(variable = num_vars,
+       iqr_outliers = sapply(num_vars, function(v) sum(iqr_flag(df[[v]]))),
+       z_outliers   = sapply(num_vars, function(v) sum(abs(scale(df[[v]])) > 3)),
+       max_value    = sapply(num_vars, function(v) max(df[[v]]))) %>%
+  mutate(pct_iqr = round(100 * iqr_outliers / nrow(df), 1)) %>%
+  kable(caption = "Outliers by method")
+```
+
+```{r outlier_plots, fig.cap="Price and minimum nights before treatment (log scale)"}
+df %>%
+  select(price, minimum_nights) %>%
+  pivot_longer(everything()) %>%
+  ggplot(aes(x = name, y = value)) +
+  geom_boxplot(fill = "steelblue", alpha = .6) +
+  scale_y_log10() +
+  labs(x = NULL, y = "Value (log scale)")
+```
+
+**Interpretation.** Both methods flag price, number of reviews, beds and bedrooms most heavily. The IQR rule flags many more points than the Z-score rule (333 versus 41 for price) because the variables are strongly right-skewed. The most expensive listings fall into two groups: very large properties (16 guests, up to 17 bedrooms) at about $7,200 per night, which are plausible group rentals, and a few 2-guest listings above $11,000, which are far more likely to be errors or placeholder prices. Low review scores were also flagged, but they are genuine guest ratings on a bounded scale, not errors. Deleting every flagged row would remove about 15% of listings for number of reviews alone and bias the sample, so I limit their influence by capping instead.
+
+### Treatment: winsorizing plus log transform
+
+**Why not delete?** Extreme values may be real (a luxury houseboat, a monthly-stay rental), and deleting thousands of rows would bias the sample. Capping at the 1st and 99th percentiles limits their influence while keeping every listing. Price is also strongly right-skewed, so a log transform is added for analysis.
+
+```{r winsorize}
+winsor <- function(x) { q <- quantile(x, c(.01, .99)); pmin(pmax(x, q[1]), q[2]) }
+
+df <- df %>%
+  mutate(across(all_of(num_vars), winsor, .names = "{.col}_w"),
+         log_price = log(price_w))
+
+tibble(variable = num_vars,
+       max_before = sapply(num_vars, function(v) max(df[[v]])),
+       max_after  = sapply(paste0(num_vars, "_w"), function(v) max(df[[v]]))) %>%
+  kable(digits = 1, caption = "Maximum before and after capping")
+```
+
+```{r skew_compare, fig.cap="Price before and after capping and log transform"}
+bind_rows(tibble(version = "1. Raw price", value = df$price),
+          tibble(version = "2. Capped price", value = df$price_w),
+          tibble(version = "3. Log of capped price", value = df$log_price)) %>%
+  ggplot(aes(x = value)) +
+  geom_histogram(bins = 40, fill = "steelblue") +
+  facet_wrap(~ version, scales = "free") +
+  labs(x = NULL, y = "Listings")
+```
+
+## 5.5 Normalization
+
+Variables sit on very different scales (e.g. `accommodates` 1 to 16 versus `availability_365` 0 to 365).
+
+```{r normalize}
+min_max <- function(x) (x - min(x)) / (max(x) - min(x))
+w_vars  <- paste0(num_vars, "_w")
+
+df <- df %>%
+  mutate(across(all_of(w_vars), min_max, .names = "{.col}_mm"),
+         across(all_of(w_vars), ~ as.numeric(scale(.)), .names = "{.col}_z"))
+
+df %>%
+  summarise(across(c(price_w, price_w_mm, price_w_z), list(min = min, max = max, mean = mean, sd = sd))) %>%
+  pivot_longer(everything(), names_to = c("variable", "stat"), names_pattern = "(.*)_(min|max|mean|sd)$") %>%
+  pivot_wider(names_from = stat, values_from = value) %>%
+  kable(digits = 3, caption = "Effect of normalization on price")
+```
+
+**When to use which.** Min-max rescales to 0 to 1 and suits distance-based methods such as KNN. Z-score (mean 0, sd 1) suits regression and PCA. Scaling was applied to the capped columns, because min-max scaling is very sensitive to extremes: a single $11,681 listing would have squashed every other price into a narrow band near zero. After scaling, `price_w_mm` runs from 0 to 1 and `price_w_z` has a mean of about 0 and a standard deviation of 1.
+
+## 5.6 Encoding categorical variables
+
+```{r encoding}
+# Nominal, few levels: one-hot encoding of room type
+room_dummies <- model.matrix(~ room_type - 1, data = df) %>% as_tibble() %>% clean_names()
+df <- bind_cols(df, room_dummies)
+
+# Nominal, many levels: lump rare neighbourhoods and property types, then frequency-encode
+df <- df %>%
+  mutate(neighbourhood_group = fct_lump_n(neighbourhood_cleansed, n = 10, other_level = "Other"),
+         property_group      = fct_lump_n(property_type, n = 6, other_level = "Other")) %>%
+  add_count(neighbourhood_cleansed, name = "neigh_count") %>%
+  mutate(neigh_freq = neigh_count / n()) %>%
+  select(-neigh_count)
+
+# Ordinal: price band built from quartiles of capped price
+df <- df %>%
+  mutate(price_band = cut(price_w,
+                          breaks = quantile(price_w, c(0, .25, .5, .75, 1)),
+                          labels = c("Budget", "Standard", "Premium", "Luxury"),
+                          include.lowest = TRUE, ordered_result = TRUE),
+         price_band_num = as.integer(price_band))
+
+# Binary flag (host_is_superhost) was encoded as 0/1 in 5.1
+df %>% select(room_type, starts_with("room_type_")) %>% head() %>% kable()
+count(df, price_band) %>% kable(caption = "Ordinal price band")
+```
+
+**Why.** Room type has few levels, so one-hot is safe. Neighbourhood has about 22 levels, so one-hot would add many sparse columns. I lump the rare ones and also give a frequency encoding. Price band is genuinely ordered, so it gets integer codes that preserve the order.
+
+# 6. Exploratory Analysis
+
+## 6.1 Descriptive statistics
+
+```{r descriptives}
+skewness <- function(x) mean(((x - mean(x)) / sd(x))^3)
+
+df %>%
+  select(all_of(num_vars)) %>%
+  pivot_longer(everything(), names_to = "variable") %>%
+  group_by(variable) %>%
+  summarise(mean = mean(value), median = median(value), sd = sd(value),
+            min = min(value), max = max(value), skew = skewness(value)) %>%
+  kable(digits = 2, caption = "Descriptive statistics (after imputation, before capping)")
+```
+
+## 6.2 Price distribution
+
+```{r price_dist, fig.cap="Distribution of nightly price"}
+ggplot(df, aes(x = price_w)) +
+  geom_histogram(bins = 40, fill = "steelblue") +
+  geom_vline(xintercept = median(df$price_w), colour = "red", linetype = "dashed") +
+  labs(x = "Capped price (USD)", y = "Listings",
+       subtitle = "Dashed line = median")
+```
+
+## 6.3 Listing mix
+
+```{r mix, fig.cap="Listings by room type"}
+df %>% count(room_type) %>% mutate(pct = round(100 * n / sum(n), 1)) %>% kable()
+
+ggplot(df, aes(x = fct_infreq(room_type), fill = room_type)) +
+  geom_bar(show.legend = FALSE) + labs(x = NULL, y = "Listings")
+```
+
+## 6.4 Price by room type and neighbourhood
+
+```{r price_room, fig.cap="Price by room type (log scale)"}
+ggplot(df, aes(x = room_type, y = price_w, fill = room_type)) +
+  geom_boxplot(show.legend = FALSE) +
+  scale_y_log10() +
+  labs(x = NULL, y = "Price (USD, log scale)")
+
+df %>% group_by(room_type) %>%
+  summarise(listings = n(), median_price = median(price), mean_price = round(mean(price), 1)) %>%
+  kable(caption = "Price by room type")
+```
+
+```{r price_neigh, fig.cap="Median price of the ten largest neighbourhoods"}
+top10 <- df %>% count(neighbourhood_cleansed, sort = TRUE) %>% slice_head(n = 10) %>% pull(neighbourhood_cleansed)
+
+df %>% filter(neighbourhood_cleansed %in% top10) %>%
+  group_by(neighbourhood_cleansed) %>%
+  summarise(median_price = median(price), listings = n()) %>%
+  ggplot(aes(x = reorder(neighbourhood_cleansed, median_price), y = median_price)) +
+  geom_col(fill = "steelblue") + coord_flip() +
+  labs(x = NULL, y = "Median price (USD)")
+```
+
+```{r neigh_entire}
+df %>% filter(room_type == "Entire home/apt", neighbourhood_cleansed %in% top10) %>%
+  group_by(neighbourhood_cleansed) %>%
+  summarise(median_price = median(price), listings = n()) %>%
+  arrange(desc(median_price)) %>%
+  kable(caption = "Median price of entire homes by neighbourhood")
+
+df %>% filter(neighbourhood_cleansed %in% top10) %>%
+  group_by(neighbourhood_cleansed) %>%
+  summarise(pct_private_room = round(100 * mean(room_type == "Private room"), 1)) %>%
+  arrange(desc(pct_private_room)) %>%
+  kable(caption = "Share of private rooms by neighbourhood")
+```
+
+**Interpretation.** Across all listings the median price differs only modestly between the ten largest neighbourhoods ($252 to $334), and the central areas do not rank first. Among entire homes the picture changes: Centrum-West has the highest median ($403), followed by De Pijp ($374), Centrum-Oost ($368) and Zuid ($366). The reason is the mix of listings, since 48% of Centrum-West listings and 44% of Centrum-Oost listings are private rooms, compared with 11% to 25% in most other areas. Comparing neighbourhoods without accounting for room type is therefore misleading.
+
+## 6.5 Price versus size and quality
+
+```{r price_size, fig.cap="Price versus number of guests"}
+ggplot(df, aes(x = accommodates, y = price_w)) +
+  geom_jitter(alpha = .15, width = .2) +
+  geom_smooth(method = "lm", colour = "red") +
+  scale_y_log10() +
+  labs(x = "Guests accommodated", y = "Price (USD, log scale)")
+```
+
+```{r price_rating, fig.cap="Price versus review rating (listings with at least one review)"}
+df %>% filter(number_of_reviews > 0) %>%
+  ggplot(aes(x = review_scores_rating, y = price_w)) +
+  geom_point(alpha = .15) +
+  geom_smooth(colour = "red") +
+  scale_y_log10() +
+  labs(x = "Review score", y = "Price (USD, log scale)")
+```
+
+```{r superhost}
+df %>% group_by(host_is_superhost) %>%
+  summarise(listings = n(), median_price = median(price), mean_rating = round(mean(review_scores_rating), 2)) %>%
+  kable(caption = "Superhost (1) versus regular host (0)")
+```
+
+```{r superhost_mix}
+df %>% count(room_type, host_is_superhost) %>%
+  group_by(host_is_superhost) %>% mutate(pct = round(100 * n / sum(n), 1)) %>%
+  kable(caption = "Room type mix by superhost status (pct is within each host group)")
+
+df %>% group_by(room_type, host_is_superhost) %>%
+  summarise(n = n(), median_price = median(price), .groups = "drop") %>%
+  kable(caption = "Median price by room type and superhost status")
+```
+
+**Interpretation.** Superhost listings have a lower median price overall ($230 versus $301), but this is largely a composition effect: about half of superhost listings are private rooms, compared with about a fifth of other listings. Within room types the picture is mixed. Superhost entire homes are about 9% cheaper ($308 versus $337), while superhost private rooms are slightly more expensive ($183 versus $173). The raw comparison therefore overstates any superhost discount.
+
+## 6.6 Geography
+
+```{r map, fig.cap="Listings by location, coloured by log price"}
+ggplot(df, aes(x = longitude, y = latitude, colour = log_price)) +
+  geom_point(alpha = .5, size = .8) +
+  scale_colour_viridis_c() +
+  coord_quickmap() +
+  labs(colour = "Log price")
+```
+
+## 6.7 Correlations
+
+```{r corr, fig.cap="Correlation matrix", fig.height=6}
+cor_mat <- df %>%
+  select(log_price, accommodates_w, bedrooms_w, beds_w, minimum_nights_w,
+         availability_365_w, number_of_reviews_w, review_scores_rating_w,
+         host_is_superhost) %>%
+  rename_with(~ str_remove(., "_w$")) %>%
+  cor()
+
+corrplot(cor_mat, method = "color", type = "upper", tl.cex = 0.7, tl.col = "black",
+         addCoef.col = "black", number.cex = 0.55)
+```
+
+**Interpretation.** Log price is most strongly related to the size of the listing: bedrooms (r = 0.52) and guests accommodated (r = 0.49). Number of reviews is negatively correlated with price (r = -0.35), review score has a weak positive correlation (r = 0.24), and superhost status is weakly negative (r = -0.17). Minimum nights and availability show almost no relationship with price. These are correlations, not causal effects, and the size variables are correlated with each other, which matters as multicollinearity in any later model.
+
+## 6.8 Statistical tests
+
+```{r tests}
+# Does price differ across room types? (not normal, so Kruskal-Wallis)
+kruskal.test(price ~ room_type, data = df)
+
+# Do superhosts charge different prices?
+wilcox.test(price ~ host_is_superhost, data = df)
+
+# Rank correlation between price and size
+cor.test(df$price, df$accommodates, method = "spearman", exact = FALSE)
+```
+
+**Interpretation.** A Kruskal-Wallis test shows that price differs significantly across room types (chi-squared = 1749.3, df = 3, p < 0.001), and a Wilcoxon rank-sum test shows a significant difference between superhosts and other hosts (p < 0.001). The Spearman correlation between price and capacity is 0.50. Non-parametric tests were used because price is strongly right-skewed. The very small p-values partly reflect the sample size, so the medians and correlations matter more than significance as a measure of effect size. The Wilcoxon test does not control for room type.
+
+# 7. Key Insights
+
+The findings below come from the cleaned data (6,039 listings with a price).
+
+1. **Price is highly skewed.** The median is $285 against a mean of $345 (skewness 16.8), and capping reduced the maximum price from $11,681 to $1,173.
+2. **Room type is the clearest price driver.** Median price is $332 for entire homes, $176 for private rooms and $63.5 for shared rooms.
+3. **Size is the strongest numeric signal.** Bedrooms (r = 0.52) and guests accommodated (r = 0.49) correlate most strongly with log price.
+4. **Raw comparisons can mislead.** Among entire homes, Centrum-West is the most expensive of the ten largest neighbourhoods (median $403), but across all listings it ranks fourth because 48% of its listings are private rooms.
+5. **The superhost discount is mostly a mix effect.** About half of superhost listings are private rooms (versus about a fifth for other hosts). Within entire homes superhosts are about 9% cheaper ($308 versus $337), while within private rooms they are slightly more expensive ($183 versus $173).
+6. **Reviews:** listings with many reviews tend to be cheaper (r = -0.35), and ratings sit near the ceiling (median 4.91), so they discriminate poorly between listings.
+7. **Data quality:** 43% of listings had no price, 598 of the 6,039 priced listings have no rating because they have no reviews, and five columns were entirely empty.
+
+# 8. Challenges and Conclusion
+
+**Challenges.** About 43% of listings have no price, numbers stored as text, structural missingness in review columns, extreme price and minimum-night values, a neighbourhood variable with many levels, and five completely empty columns.
+
+**Conclusion.** I cleaned the Inside Airbnb Amsterdam listings by removing five empty columns, converting text prices to numbers, handling missing values with a justified strategy per column, capping outliers at the 1st and 99th percentiles, scaling the numeric variables and encoding the categorical ones. The cleaned dataset of 6,039 priced listings is ready for a model predicting `log_price`.
+
+**Limitations.** The data is a single snapshot, and listed prices are asking prices, not actual booking revenue.
+
+# Appendix: Reproducibility
+
+```{r session}
+sessionInfo()
+```
+
+
+
+
