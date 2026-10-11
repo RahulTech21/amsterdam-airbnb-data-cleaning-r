@@ -1,6 +1,6 @@
 ---
 title: "Data Cleaning and Preliminary Analysis: Airbnb Listings in Amsterdam"
-author: "Your Name"
+author: "Rahul Jadhav"
 date: "`r format(Sys.Date(), '%d %B %Y')`"
 output:
   word_document:
