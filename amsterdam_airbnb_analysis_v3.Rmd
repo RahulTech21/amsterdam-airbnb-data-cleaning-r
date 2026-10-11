@@ -31,7 +31,7 @@ library(knitr)
 
 # 2. Dataset Overview
 
-**Source.** Inside Airbnb (https://insideairbnb.com/get-the-data/), Amsterdam, the detailed file `listings.csv.gz`. *(Write the snapshot date shown on the website here.)*
+**Source.** Inside Airbnb (https://insideairbnb.com/get-the-data/), Amsterdam, the detailed file `listings.csv.gz`. *(16 Sep 2026)*
 
 **Why this dataset.** It is real scraped data, with text-formatted numbers (`$1,200.00`, `95%`), genuine missing values, extreme price and minimum-night outliers, and a mix of numeric, binary and categorical variables.
 
